@@ -11,6 +11,7 @@ email: albertobsd@gmail.com
 #include <time.h>
 #include <vector>
 #include <inttypes.h>
+#include <ctype.h>
 #include "base58/libbase58.h"
 #include "rmd160/rmd160.h"
 #include "oldbloom/oldbloom.h"
@@ -74,6 +75,11 @@ struct bsgs_xvalue	{
 
 struct address_value	{
 	uint8_t value[20];
+};
+
+struct range_item {
+	Int start;
+	Int end;
 };
 
 struct tothread {
@@ -219,6 +225,12 @@ void increment_minikey_N(char *rawbuffer);
 	
 void KECCAK_256(uint8_t *source, size_t size,uint8_t *dst);
 void generate_binaddress_eth(Point &publickey,unsigned char *dst_address);
+char *trim_whitespace(char *str);
+char *strip_hex_prefix(char *str);
+bool readRangeFile(char *fileName);
+void printRangeStatus(size_t index, size_t total, Int *start, Int *end);
+bool advanceRangeFileLocked();
+void init_dance_range();
 
 int THREADOUTPUT = 0;
 char *bit_range_str_min;
@@ -307,12 +319,15 @@ int FLAGRAWDATA	= 0;
 int FLAGRANDOM = 0;
 int FLAG_N = 0;
 int FLAGPRECALCUTED_P_FILE = 0;
+int FLAGRANGEFILE = 0;
+int FLAGDANCE = 0;
 
 int bitrange;
 char *str_N;
 char *range_start;
 char *range_end;
 char *str_stride;
+char *range_file_name;
 Int stride;
 
 uint64_t BSGS_XVALUE_RAM = 6;
@@ -407,6 +422,10 @@ Int n_range_start;
 Int n_range_end;
 Int n_range_diff;
 Int n_range_aux;
+Int n_range_dance_top;
+std::vector<struct range_item> range_list;
+size_t range_file_index = 0;
+int range_file_done = 0;
 
 Int lambda,lambda2,beta,beta2;
 
@@ -486,7 +505,7 @@ int main(int argc, char **argv)	{
 	
 	printf("[+] Version %s, developed by AlbertoBSD\n",version);
 
-	while ((c = getopt(argc, argv, "deh6MqRSB:b:c:C:E:f:I:k:l:m:N:n:p:r:s:t:v:G:8:z:")) != -1) {
+	while ((c = getopt(argc, argv, "deh6MqRSB:b:c:C:E:f:I:k:l:m:N:n:p:r:s:t:v:G:8:z:P:D")) != -1) {
 		switch(c) {
 			case 'h':
 				menu();
@@ -576,6 +595,10 @@ int main(int argc, char **argv)	{
 				FLAGDEBUG = 1;
 				printf("[+] Flag DEBUG enabled\n");
 			break;
+			case 'D':
+				FLAGDANCE = 1;
+				printf("[+] Dance mode enabled\n");
+			break;
 			case 'e':
 				FLAGENDOMORPHISM = 1;
 				printf("[+] Endomorphism enabled\n");
@@ -587,6 +610,10 @@ int main(int argc, char **argv)	{
 			case 'f':
 				FLAGFILE = 1;
 				fileName = optarg;
+			break;
+			case 'P':
+				FLAGRANGEFILE = 1;
+				range_file_name = optarg;
 			break;
 			case 'I':
 				FLAGSTRIDE = 1;
@@ -781,6 +808,10 @@ int main(int argc, char **argv)	{
 		fprintf(stderr,"[E] Endomorphism doesn't work with BSGS\n");
 		exit(EXIT_FAILURE);
 	}
+	if(FLAGDANCE && FLAGRANDOM)	{
+		fprintf(stderr,"[W] Random mode disabled because dance mode is in use\n");
+		FLAGRANDOM = 0;
+	}
 	
 	
 	if(  FLAGBSGSMODE == MODE_BSGS  && FLAGSTRIDE)	{
@@ -804,6 +835,10 @@ int main(int argc, char **argv)	{
 	if(FLAGMODE == MODE_BSGS )	{
 		printf("[+] Mode BSGS %s\n",bsgs_modes[FLAGBSGSMODE]);
 	}
+	if(FLAGDANCE && FLAGMODE == MODE_BSGS)	{
+		fprintf(stderr,"[W] Dance mode for BSGS is controlled by -B dance\n");
+		FLAGDANCE = 0;
+	}
 	
 	if(FLAGFILE == 0) {
 		fileName =(char*) default_fileName;
@@ -813,7 +848,38 @@ int main(int argc, char **argv)	{
 		FLAGCRYPTO = CRYPTO_BTC;
 		printf("[+] Setting search for btc adddress\n");
 	}
-	if(FLAGRANGE) {
+	if(FLAGRANGEFILE)	{
+		if(FLAGMODE == MODE_BSGS)	{
+			fprintf(stderr,"[E] Range file is not supported with BSGS mode\n");
+			exit(EXIT_FAILURE);
+		}
+		if(FLAGRANDOM)	{
+			fprintf(stderr,"[W] Random mode disabled because range file is in use\n");
+			FLAGRANDOM = 0;
+		}
+		if(FLAGBITRANGE)	{
+			fprintf(stderr,"[W] Ignoring bit range because range file is in use\n");
+			FLAGBITRANGE = 0;
+		}
+		if(FLAGRANGE)	{
+			fprintf(stderr,"[W] Ignoring -r range because range file is in use\n");
+			FLAGRANGE = 0;
+		}
+		if(!readRangeFile(range_file_name))	{
+			exit(EXIT_FAILURE);
+		}
+		FLAGRANGE = 1;
+		range_file_index = 0;
+		range_file_done = 0;
+		n_range_start.Set(&range_list[0].start);
+		n_range_end.Set(&range_list[0].end);
+		n_range_diff.Set(&n_range_end);
+		n_range_diff.Sub(&n_range_start);
+		if(FLAGDANCE)	{
+			init_dance_range();
+		}
+	}
+	if(FLAGRANGE && !FLAGRANGEFILE) {
 		n_range_start.SetBase16(range_start);
 		if(n_range_start.IsZero())	{
 			n_range_start.AddOne();
@@ -829,6 +895,9 @@ int main(int argc, char **argv)	{
 				}
 				n_range_diff.Set(&n_range_end);
 				n_range_diff.Sub(&n_range_start);
+				if(FLAGDANCE)	{
+					init_dance_range();
+				}
 			}
 			else	{
 				fprintf(stderr,"[E] Start and End range can't be great than N\nFallback to random mode!\n");
@@ -847,6 +916,9 @@ int main(int argc, char **argv)	{
 			n_range_end.Set(&secp->order);
 			n_range_diff.Set(&n_range_end);
 			n_range_diff.Sub(&n_range_start);
+			if(FLAGDANCE)	{
+				init_dance_range();
+			}
 		}
 		else	{
 			if(FLAGBITRANGE)	{
@@ -854,6 +926,9 @@ int main(int argc, char **argv)	{
 				n_range_end.SetBase16(bit_range_str_max);
 				n_range_diff.Set(&n_range_end);
 				n_range_diff.Sub(&n_range_start);
+				if(FLAGDANCE)	{
+					init_dance_range();
+				}
 			}
 			else	{
 				if(FLAGRANGE == 0)	{
@@ -920,11 +995,15 @@ int main(int argc, char **argv)	{
 			if(FLAGBITRANGE)	{	// Bit Range
 				printf("[+] Bit Range %i\n",bitrange);
 			}
+			else if(FLAGRANGEFILE)	{
+				printf("[+] Range file\n");
+				printRangeStatus(range_file_index,range_list.size(),&n_range_start,&n_range_end);
+			}
 			else	{
 				printf("[+] Range \n");
 			}
 		}
-		if(FLAGMODE != MODE_MINIKEYS)	{
+		if(FLAGMODE != MODE_MINIKEYS && !FLAGRANGEFILE)	{
 			hextemp = n_range_start.GetBase16();
 			printf("[+] -- from : 0x%s\n",hextemp);
 			free(hextemp);
@@ -2538,27 +2617,103 @@ void *thread_process(void *vargp)	{
 	char publickeyhashrmd160_endomorphism[12][4][20];
 	
 	bool calculate_y = FLAGSEARCH == SEARCH_UNCOMPRESS || FLAGSEARCH == SEARCH_BOTH || FLAGCRYPTO  == CRYPTO_ETH;
-	Int key_mpz,keyfound,temp_stride;
+	Int key_mpz,keyfound,temp_stride,temp_stride_block,temp_stride_step4;
 	tt = (struct tothread *)vargp;
 	thread_number = tt->nt;
 	free(tt);
 	grp->Set(dx);
+	temp_stride_block.SetInt32(CPU_GRP_SIZE / 2);
+	temp_stride_block.Mult(&stride);
+	temp_stride_step4.SetInt32(4);
+	temp_stride_step4.Mult(&stride);
 			
 	do {
 		if(FLAGRANDOM){
 			key_mpz.Rand(&n_range_start,&n_range_end);
 		}
-		else	{
-			if(n_range_start.IsLower(&n_range_end))	{
+			else	{
+				if(FLAGDANCE)	{
+					bool allocated = false;
 #if defined(_WIN64) && !defined(__CYGWIN__)
-				WaitForSingleObject(write_random, INFINITE);
-				key_mpz.Set(&n_range_start);
-				n_range_start.Add(N_SEQUENTIAL_MAX);
-				ReleaseMutex(write_random);
+					WaitForSingleObject(write_random, INFINITE);
+#else
+					pthread_mutex_lock(&write_random);
+#endif
+					for(int attempt = 0; attempt < 2 && !allocated; attempt++)	{
+						int r = rand() % 3;
+						if(r == 0)	{	// bottom
+							if(n_range_start.IsLower(&n_range_dance_top))	{
+								key_mpz.Set(&n_range_start);
+								n_range_start.Add(N_SEQUENTIAL_MAX);
+								allocated = true;
+							}
+						}
+						else if(r == 1)	{	// top
+							if(n_range_dance_top.IsGreater(&n_range_start))	{
+								Int temp_top;
+								temp_top.Set(&n_range_dance_top);
+								temp_top.Sub(N_SEQUENTIAL_MAX);
+								if(!temp_top.IsLower(&n_range_start))	{
+									n_range_dance_top.Set(&temp_top);
+									key_mpz.Set(&n_range_dance_top);
+									allocated = true;
+								}
+							}
+						}
+						else	{	// random
+							if(n_range_start.IsLower(&n_range_dance_top))	{
+								key_mpz.Rand(&n_range_start,&n_range_dance_top);
+								allocated = true;
+							}
+						}
+						if(!allocated && FLAGRANGEFILE)	{
+							if(!advanceRangeFileLocked())	{
+								break;
+							}
+						}
+					}
+					if(!allocated)	{
+						continue_flag = 0;
+					}
+#if defined(_WIN64) && !defined(__CYGWIN__)
+					ReleaseMutex(write_random);
+#else
+					pthread_mutex_unlock(&write_random);
+#endif
+				}
+				else if(n_range_start.IsLower(&n_range_end))	{
+#if defined(_WIN64) && !defined(__CYGWIN__)
+					WaitForSingleObject(write_random, INFINITE);
+					key_mpz.Set(&n_range_start);
+					n_range_start.Add(N_SEQUENTIAL_MAX);
+					ReleaseMutex(write_random);
 #else
 				pthread_mutex_lock(&write_random);
 				key_mpz.Set(&n_range_start);
 				n_range_start.Add(N_SEQUENTIAL_MAX);
+				pthread_mutex_unlock(&write_random);
+#endif
+			}
+				else if(FLAGRANGEFILE)	{
+#if defined(_WIN64) && !defined(__CYGWIN__)
+					WaitForSingleObject(write_random, INFINITE);
+					if(advanceRangeFileLocked())	{
+						key_mpz.Set(&n_range_start);
+						n_range_start.Add(N_SEQUENTIAL_MAX);
+				}
+				else	{
+					continue_flag = 0;
+				}
+				ReleaseMutex(write_random);
+#else
+				pthread_mutex_lock(&write_random);
+				if(advanceRangeFileLocked())	{
+					key_mpz.Set(&n_range_start);
+					n_range_start.Add(N_SEQUENTIAL_MAX);
+				}
+				else	{
+					continue_flag = 0;
+				}
 				pthread_mutex_unlock(&write_random);
 #endif
 			}
@@ -2568,14 +2723,14 @@ void *thread_process(void *vargp)	{
 		}
 		if(continue_flag)	{
 			count = 0;
-			if(FLAGMATRIX)	{
+			if(FLAGMATRIX && thread_number == 0)	{
 					hextemp = key_mpz.GetBase16();
 					printf("Base key: %s thread %i\n",hextemp,thread_number);
 					fflush(stdout);
 					free(hextemp);
 			}
 			else	{
-				if(FLAGQUIET == 0){
+				if(FLAGQUIET == 0 && thread_number == 0){
 					hextemp = key_mpz.GetBase16();
 					printf("\rBase key: %s     \r",hextemp);
 					fflush(stdout);
@@ -2584,11 +2739,9 @@ void *thread_process(void *vargp)	{
 				}
 			}
 			do {
-				temp_stride.SetInt32(CPU_GRP_SIZE / 2);
-				temp_stride.Mult(&stride);
-				key_mpz.Add(&temp_stride);
+				key_mpz.Add(&temp_stride_block);
 	 			startP = secp->ComputePublicKey(&key_mpz);
-				key_mpz.Sub(&temp_stride);
+				key_mpz.Sub(&temp_stride_block);
 
 				for(i = 0; i < hLength; i++) {
 					dx[i].ModSub(&Gn[i].x,&startP.x);
@@ -3062,9 +3215,7 @@ void *thread_process(void *vargp)	{
 						break;
 					}
 					count+=4;
-					temp_stride.SetInt32(4);
-					temp_stride.Mult(&stride);
-					key_mpz.Add(&temp_stride);
+				key_mpz.Add(&temp_stride_step4);
 				}
 				/*
 				if(FLAGDEBUG) {
@@ -3130,11 +3281,15 @@ void *thread_process_vanity(void *vargp)	{
 	
 	char publickeyhashrmd160_endomorphism[12][4][20];
 	
-	Int key_mpz,temp_stride,keyfound;
+	Int key_mpz,temp_stride,keyfound,temp_stride_block,temp_stride_step4;
 	tt = (struct tothread *)vargp;
 	thread_number = tt->nt;
 	free(tt);
 	grp->Set(dx);
+	temp_stride_block.SetInt32(CPU_GRP_SIZE / 2);
+	temp_stride_block.Mult(&stride);
+	temp_stride_step4.SetInt32(4);
+	temp_stride_step4.Mult(&stride);
 	
 	
 	//if FLAGENDOMORPHISM  == 1 and only compress search is enabled then there is no need to calculate the Y value value					
@@ -3158,17 +3313,89 @@ void *thread_process_vanity(void *vargp)	{
 		if(FLAGRANDOM){
 			key_mpz.Rand(&n_range_start,&n_range_end);
 		}
-		else	{
-			if(n_range_start.IsLower(&n_range_end))	{
+			else	{
+				if(FLAGDANCE)	{
+					bool allocated = false;
 #if defined(_WIN64) && !defined(__CYGWIN__)
-				WaitForSingleObject(write_random, INFINITE);
-				key_mpz.Set(&n_range_start);
-				n_range_start.Add(N_SEQUENTIAL_MAX);
-				ReleaseMutex(write_random);
+					WaitForSingleObject(write_random, INFINITE);
+#else
+					pthread_mutex_lock(&write_random);
+#endif
+					for(int attempt = 0; attempt < 2 && !allocated; attempt++)	{
+						int r = rand() % 3;
+						if(r == 0)	{	// bottom
+							if(n_range_start.IsLower(&n_range_dance_top))	{
+								key_mpz.Set(&n_range_start);
+								n_range_start.Add(N_SEQUENTIAL_MAX);
+								allocated = true;
+							}
+						}
+						else if(r == 1)	{	// top
+							if(n_range_dance_top.IsGreater(&n_range_start))	{
+								Int temp_top;
+								temp_top.Set(&n_range_dance_top);
+								temp_top.Sub(N_SEQUENTIAL_MAX);
+								if(!temp_top.IsLower(&n_range_start))	{
+									n_range_dance_top.Set(&temp_top);
+									key_mpz.Set(&n_range_dance_top);
+									allocated = true;
+								}
+							}
+						}
+						else	{	// random
+							if(n_range_start.IsLower(&n_range_dance_top))	{
+								key_mpz.Rand(&n_range_start,&n_range_dance_top);
+								allocated = true;
+							}
+						}
+						if(!allocated && FLAGRANGEFILE)	{
+							if(!advanceRangeFileLocked())	{
+								break;
+							}
+						}
+					}
+					if(!allocated)	{
+						continue_flag = 0;
+					}
+#if defined(_WIN64) && !defined(__CYGWIN__)
+					ReleaseMutex(write_random);
+#else
+					pthread_mutex_unlock(&write_random);
+#endif
+				}
+				else if(n_range_start.IsLower(&n_range_end))	{
+#if defined(_WIN64) && !defined(__CYGWIN__)
+					WaitForSingleObject(write_random, INFINITE);
+					key_mpz.Set(&n_range_start);
+					n_range_start.Add(N_SEQUENTIAL_MAX);
+					ReleaseMutex(write_random);
 #else
 				pthread_mutex_lock(&write_random);
 				key_mpz.Set(&n_range_start);
 				n_range_start.Add(N_SEQUENTIAL_MAX);
+				pthread_mutex_unlock(&write_random);
+#endif
+			}
+				else if(FLAGRANGEFILE)	{
+#if defined(_WIN64) && !defined(__CYGWIN__)
+					WaitForSingleObject(write_random, INFINITE);
+					if(advanceRangeFileLocked())	{
+						key_mpz.Set(&n_range_start);
+						n_range_start.Add(N_SEQUENTIAL_MAX);
+				}
+				else	{
+					continue_flag = 0;
+				}
+				ReleaseMutex(write_random);
+#else
+				pthread_mutex_lock(&write_random);
+				if(advanceRangeFileLocked())	{
+					key_mpz.Set(&n_range_start);
+					n_range_start.Add(N_SEQUENTIAL_MAX);
+				}
+				else	{
+					continue_flag = 0;
+				}
 				pthread_mutex_unlock(&write_random);
 #endif
 			}
@@ -3178,14 +3405,14 @@ void *thread_process_vanity(void *vargp)	{
 		}
 		if(continue_flag)	{
 			count = 0;
-			if(FLAGMATRIX)	{
+			if(FLAGMATRIX && thread_number == 0)	{
 					hextemp = key_mpz.GetBase16();
 					printf("Base key: %s thread %i\n",hextemp,thread_number);
 					fflush(stdout);
 					free(hextemp);
 			}
 			else	{
-				if(FLAGQUIET == 0)	{
+				if(FLAGQUIET == 0 && thread_number == 0)	{
 					hextemp = key_mpz.GetBase16();
 					printf("\rBase key: %s     \r",hextemp);
 					fflush(stdout);
@@ -3194,11 +3421,9 @@ void *thread_process_vanity(void *vargp)	{
 				}
 			}
 			do {
-				temp_stride.SetInt32(CPU_GRP_SIZE / 2);
-				temp_stride.Mult(&stride);
-				key_mpz.Add(&temp_stride);
+				key_mpz.Add(&temp_stride_block);
 	 			startP = secp->ComputePublicKey(&key_mpz);
-				key_mpz.Sub(&temp_stride);
+				key_mpz.Sub(&temp_stride_block);
 
 				for(i = 0; i < hLength; i++) {
 					dx[i].ModSub(&Gn[i].x,&startP.x);
@@ -3506,9 +3731,7 @@ void *thread_process_vanity(void *vargp)	{
 					}
 
 					count+=4;
-					temp_stride.SetInt32(4);
-					temp_stride.Mult(&stride);
-					key_mpz.Add(&temp_stride);
+					key_mpz.Add(&temp_stride_step4);
 				}
 				steps[thread_number]++;
 
@@ -5738,6 +5961,158 @@ void sha256sse_23(uint8_t *src0, uint8_t *src1, uint8_t *src2, uint8_t *src3, ui
   sha256sse_1B(b0, b1, b2, b3, dst0, dst1, dst2, dst3);
 }
 
+char *trim_whitespace(char *str)	{
+	char *end;
+	while(isspace((unsigned char)*str))	{
+		str++;
+	}
+	if(*str == '\0')	{
+		return str;
+	}
+	end = str + strlen(str) - 1;
+	while(end > str && isspace((unsigned char)*end))	{
+		end--;
+	}
+	end[1] = '\0';
+	return str;
+}
+
+char *strip_hex_prefix(char *str)	{
+	if(str[0] == '0' && (str[1] == 'x' || str[1] == 'X'))	{
+		return str + 2;
+	}
+	return str;
+}
+
+void printRangeStatus(size_t index, size_t total, Int *start, Int *end)	{
+	char *start_hex = start->GetBase16();
+	char *end_hex = end->GetBase16();
+	printf("[+] Range file %zu/%zu\n",index + 1,total);
+	printf("[+] -- from : 0x%s\n",start_hex);
+	printf("[+] -- to   : 0x%s\n",end_hex);
+	free(start_hex);
+	free(end_hex);
+}
+
+bool advanceRangeFileLocked()	{
+	if(range_file_index + 1 >= range_list.size())	{
+		if(!range_file_done)	{
+			range_file_done = 1;
+			printf("[+] Completed all ranges from file\n");
+		}
+		return false;
+	}
+	range_file_index++;
+	n_range_start.Set(&range_list[range_file_index].start);
+	n_range_end.Set(&range_list[range_file_index].end);
+	n_range_diff.Set(&n_range_end);
+	n_range_diff.Sub(&n_range_start);
+	if(FLAGDANCE)	{
+		init_dance_range();
+	}
+	printRangeStatus(range_file_index,range_list.size(),&n_range_start,&n_range_end);
+	return true;
+}
+
+bool readRangeFile(char *fileName)	{
+	FILE *fileDescriptor;
+	char line[1024];
+	int line_number = 0;
+
+	fileDescriptor = fopen(fileName,"r");
+	if(fileDescriptor == NULL)	{
+		fprintf(stderr,"[E] Error opening range file %s\n",fileName);
+		return false;
+	}
+
+	while(fgets(line,sizeof(line),fileDescriptor) != NULL)	{
+		line_number++;
+		char *trimmed = trim_whitespace(line);
+		if(trimmed[0] == '\0' || trimmed[0] == '#')	{
+			continue;
+		}
+		char *comment = strchr(trimmed,'#');
+		if(comment != NULL)	{
+			*comment = '\0';
+			trimmed = trim_whitespace(trimmed);
+			if(trimmed[0] == '\0')	{
+				continue;
+			}
+		}
+		char *separator = strchr(trimmed,':');
+		char *start_token = trimmed;
+		char *end_token = NULL;
+		if(separator != NULL)	{
+			*separator = '\0';
+			end_token = separator + 1;
+		}
+		start_token = trim_whitespace(start_token);
+		if(end_token != NULL)	{
+			end_token = trim_whitespace(end_token);
+		}
+		if(start_token[0] == '\0')	{
+			fprintf(stderr,"[E] Empty start range in %s line %i\n",fileName,line_number);
+			fclose(fileDescriptor);
+			return false;
+		}
+		start_token = strip_hex_prefix(start_token);
+		if(!isValidHex(start_token))	{
+			fprintf(stderr,"[E] Invalid hex string in %s line %i: %s\n",fileName,line_number,start_token);
+			fclose(fileDescriptor);
+			return false;
+		}
+		if(end_token != NULL && end_token[0] != '\0')	{
+			end_token = strip_hex_prefix(end_token);
+			if(!isValidHex(end_token))	{
+				fprintf(stderr,"[E] Invalid hex string in %s line %i: %s\n",fileName,line_number,end_token);
+				fclose(fileDescriptor);
+				return false;
+			}
+		}
+
+		struct range_item item;
+		item.start.SetBase16(start_token);
+		if(item.start.IsZero())	{
+			item.start.AddOne();
+		}
+		if(end_token != NULL && end_token[0] != '\0')	{
+			item.end.SetBase16(end_token);
+		}
+		else	{
+			item.end.Set(&secp->order);
+		}
+		if(item.start.IsEqual(&item.end))	{
+			fprintf(stderr,"[E] Start and End range can't be the same in %s line %i\n",fileName,line_number);
+			fclose(fileDescriptor);
+			return false;
+		}
+		if(item.start.IsLower(&secp->order) && item.end.IsLowerOrEqual(&secp->order))	{
+			if(item.start.IsGreater(&item.end))	{
+				fprintf(stderr,"[W] Opps, start range can't be great than end range in %s line %i. Swapping them\n",fileName,line_number);
+				n_range_aux.Set(&item.start);
+				item.start.Set(&item.end);
+				item.end.Set(&n_range_aux);
+			}
+			range_list.push_back(item);
+		}
+		else	{
+			fprintf(stderr,"[E] Range values can't be greater than N in %s line %i\n",fileName,line_number);
+			fclose(fileDescriptor);
+			return false;
+		}
+	}
+	fclose(fileDescriptor);
+	if(range_list.empty())	{
+		fprintf(stderr,"[E] There is no valid range in file %s\n",fileName);
+		return false;
+	}
+	return true;
+}
+
+void init_dance_range()	{
+	n_range_dance_top.Set(&n_range_end);
+}
+
 void menu() {
 	printf("\nUsage:\n");
 	printf("-h          show this help\n");
@@ -5747,6 +6122,7 @@ void menu() {
 	printf("-C mini     Set the minikey Base only 22 character minikeys, ex: SRPqx8QiwnW4WNWnTVa2W5\n");
 	printf("-8 alpha    Set the bas58 alphabet for minikeys\n");
 	printf("-e          Enable endomorphism search (Only for address, rmd160 and vanity)\n");
+	printf("-D          Dance mode for sequential search (address/rmd160/vanity/xpoint)\n");
 	printf("-f file     Specify file name with addresses or xpoints or uncompressed public keys\n");
 	printf("-I stride   Stride for xpoint, rmd160 and address, this option don't work with bsgs\n");
 	printf("-k value    Use this only with bsgs mode, k value is factor for M, more speed but more RAM use wisely\n");
@@ -5757,6 +6133,7 @@ void menu() {
 	printf("            Use -n to set the N for the BSGS process. Bigger N more RAM needed\n");
 	printf("-q          Quiet the thread output\n");
 	printf("-r SR:EN    StarRange:EndRange, the end range can be omitted for search from start range to N-1 ECC value\n");
+	printf("-P file     File with ranges, format SR:EN per line, end can be omitted\n");
 	printf("-R          Random, this is the default behavior\n");
 	printf("-s ns       Number of seconds for the stats output, 0 to omit output.\n");
 	printf("-S          S is for SAVING in files BSGS data (Bloom filters and bPtable)\n");
